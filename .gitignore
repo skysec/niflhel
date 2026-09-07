@@ -1,0 +1,7 @@
+/bin/
+/coverage.out
+/.cache/
+*.ext4
+*.pem
+*.key
+/keys/

@@ -1,0 +1,10 @@
+{
+  "Root": "/var/lib/niflhel",
+  "Socket": "/run/niflhel/niflhel.sock",
+  "Firecracker": "/usr/local/bin/firecracker",
+  "Jailer": "/usr/local/bin/jailer",
+  "DefaultBase": "",
+  "TrustedKeys": {},
+  "DNSUpstream": "1.1.1.1:53",
+  "BootTimeoutSeconds": 60
+}

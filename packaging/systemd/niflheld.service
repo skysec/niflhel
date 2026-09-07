@@ -1,0 +1,22 @@
+[Unit]
+Description=Niflhel Firecracker container sandbox service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/niflheld --config /etc/niflhel/config.json
+Restart=on-failure
+RestartSec=2
+RuntimeDirectory=niflhel
+RuntimeDirectoryMode=0700
+StateDirectory=niflhel
+StateDirectoryMode=0700
+UMask=0077
+# VMMs have separate jailer cgroups and survive a daemon-only restart.
+KillMode=process
+Delegate=yes
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,7 @@
+apiVersion: niflhel.dev/v1alpha1
+kind: BaseRecipe
+spec:
+  platform: linux/amd64
+  kernel:
+    # Replace with an approved OCI image containing /boot/vmlinux.
+    ref: registry.example.com/niflhel/kernel@sha256:REPLACE_WITH_DIGEST
