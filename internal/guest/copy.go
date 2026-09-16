@@ -28,8 +28,13 @@ func (a *Agent) copy(ctx context.Context, q api.Request, s *wire.Stream) error {
 		return fmt.Errorf("invalid container PID")
 	}
 	root := fmt.Sprintf("/proc/%d/root", pid)
+	rootDir, e := os.Open(root)
+	if e != nil {
+		return e
+	}
+	defer rootDir.Close()
 	if q.Action == "copy-out" {
-		if e = filecopy.Archive(root, q.Path, streamWriter{s, "data"}); e != nil {
+		if e = filecopy.ArchiveRoot(rootDir, q.Path, streamWriter{s, "data"}); e != nil {
 			return e
 		}
 		return s.Send(api.Frame{Type: "exit"})
@@ -56,7 +61,7 @@ func (a *Agent) copy(ctx context.Context, q api.Request, s *wire.Stream) error {
 			}
 		}
 	}()
-	if e = filecopy.Extract(root, q.Path, r); e != nil {
+	if e = filecopy.ExtractRoot(rootDir, q.Path, r); e != nil {
 		return e
 	}
 	return s.Send(api.Frame{Type: "exit"})

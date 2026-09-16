@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 )
 
@@ -22,8 +23,37 @@ func clean(s string) (string, error) {
 	}
 	return s, nil
 }
+
+func pathFD(name string, flags int) (int, error) {
+	rel, e := rootRelative(name)
+	if e != nil {
+		return -1, e
+	}
+	root, e := unix.Open("/", unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if e != nil {
+		return -1, e
+	}
+	defer unix.Close(root)
+	return unix.Openat2(root, rel, &unix.OpenHow{
+		Flags:   uint64(flags | unix.O_CLOEXEC),
+		Resolve: unix.RESOLVE_IN_ROOT | unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_MAGICLINKS,
+	})
+}
+
+func rootRelative(name string) (string, error) {
+	abs, e := filepath.Abs(name)
+	if e != nil {
+		return "", e
+	}
+	rel := strings.TrimPrefix(filepath.ToSlash(abs), "/")
+	if rel == "" {
+		rel = "."
+	}
+	return rel, nil
+}
+
 func rootFD(root string) (int, error) {
-	return unix.Open(root, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	return pathFD(root, unix.O_PATH|unix.O_DIRECTORY)
 }
 func open(root int, p string, flags int, mode uint32) (*os.File, error) {
 	fd, e := unix.Openat2(root, p, &unix.OpenHow{Flags: uint64(flags | unix.O_CLOEXEC), Mode: uint64(mode), Resolve: unix.RESOLVE_IN_ROOT | unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_MAGICLINKS})
@@ -73,6 +103,39 @@ func Extract(root, dest string, r io.Reader) error {
 		return e
 	}
 	defer unix.Close(fd)
+	return extract(fd, dest, r)
+}
+
+// ExtractRoot extracts relative to an already-open directory. The guest uses
+// this for the intentionally followed /proc/PID/root magic link.
+func ExtractRoot(root *os.File, dest string, r io.Reader) error {
+	fd, e := directoryFD(root)
+	if e != nil {
+		return e
+	}
+	return extract(fd, dest, r)
+}
+
+// OpenDestinationRoot creates and pins a destination directory without
+// following symlinks in any path component.
+func OpenDestinationRoot(name string) (*os.File, error) {
+	rel, e := rootRelative(name)
+	if e != nil {
+		return nil, e
+	}
+	root, e := unix.Open("/", unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if e != nil {
+		return nil, e
+	}
+	defer unix.Close(root)
+	if e = mkdir(root, rel); e != nil {
+		return nil, e
+	}
+	return open(root, rel, unix.O_PATH|unix.O_DIRECTORY, 0)
+}
+
+func extract(fd int, dest string, r io.Reader) error {
+	var e error
 	dest, e = clean(dest)
 	if e != nil {
 		return e
@@ -135,31 +198,118 @@ func Extract(root, dest string, r io.Reader) error {
 		}
 	}
 }
+
+// ArchiveSource pins a regular file or directory selected for archiving.
+// ArchiveTo uses this descriptor instead of resolving the source path again.
+type ArchiveSource struct {
+	file *os.File
+	name string
+}
+
+// OpenArchiveSource atomically rejects symlinks and magic links in the source
+// path and derives the archive layout from the opened object.
+func OpenArchiveSource(source string) (*ArchiveSource, error) {
+	fd, e := pathFD(source, unix.O_RDONLY|unix.O_NONBLOCK)
+	if e != nil {
+		return nil, e
+	}
+	f := os.NewFile(uintptr(fd), source)
+	st, e := f.Stat()
+	if e != nil {
+		f.Close()
+		return nil, e
+	}
+	if !st.IsDir() && !st.Mode().IsRegular() {
+		f.Close()
+		return nil, fmt.Errorf("copy supports regular files/directories only")
+	}
+	name := filepath.Base(source)
+	if st.IsDir() {
+		name = "."
+	}
+	return &ArchiveSource{file: f, name: name}, nil
+}
+
+func (s *ArchiveSource) Close() error {
+	if s == nil || s.file == nil {
+		return nil
+	}
+	return s.file.Close()
+}
+
+func (s *ArchiveSource) ArchiveTo(w io.Writer) error {
+	if s == nil || s.file == nil {
+		return fmt.Errorf("invalid archive source")
+	}
+	return archiveFile(s.file, s.name, w)
+}
+
+func directoryFD(root *os.File) (int, error) {
+	if root == nil {
+		return -1, fmt.Errorf("invalid copy root")
+	}
+	st, e := root.Stat()
+	if e != nil {
+		return -1, e
+	}
+	if !st.IsDir() {
+		return -1, fmt.Errorf("copy root must be a directory")
+	}
+	return int(root.Fd()), nil
+}
+
+func archiveAt(fd int, src string, w io.Writer) error {
+	var e error
+	src, e = clean(src)
+	if e != nil {
+		return e
+	}
+	f, e := open(fd, src, unix.O_RDONLY|unix.O_NONBLOCK, 0)
+	if e != nil {
+		return e
+	}
+	defer f.Close()
+	st, e := f.Stat()
+	if e != nil {
+		return e
+	}
+	name := path.Base(src)
+	if st.IsDir() {
+		name = "."
+	}
+	return archiveFile(f, name, w)
+}
+
 func Archive(root, src string, w io.Writer) error {
 	fd, e := rootFD(root)
 	if e != nil {
 		return e
 	}
 	defer unix.Close(fd)
-	src, e = clean(src)
+	return archiveAt(fd, src, w)
+}
+
+// ArchiveRoot archives relative to an already-open directory. The guest uses
+// this for the intentionally followed /proc/PID/root magic link.
+func ArchiveRoot(root *os.File, src string, w io.Writer) error {
+	fd, e := directoryFD(root)
 	if e != nil {
 		return e
 	}
+	return archiveAt(fd, src, w)
+}
+
+func archiveFile(source *os.File, sourceName string, w io.Writer) error {
 	tw := tar.NewWriter(w)
 	defer tw.Close()
 	var total int64
 	count := 0
-	var walk func(string, string) error
-	walk = func(p, name string) error {
+	var walk func(*os.File, string) error
+	walk = func(f *os.File, name string) error {
 		count++
 		if count > 10000 {
 			return fmt.Errorf("copy file count limit")
 		}
-		f, e := open(fd, p, unix.O_RDONLY, 0)
-		if e != nil {
-			return e
-		}
-		defer f.Close()
 		st, e := f.Stat()
 		if e != nil {
 			return e
@@ -183,8 +333,17 @@ func Archive(root, src string, w io.Writer) error {
 				return e
 			}
 			for _, v := range entries {
-				if e = walk(path.Join(p, v.Name()), path.Join(name, v.Name())); e != nil {
+				child, e := open(int(f.Fd()), v.Name(), unix.O_RDONLY|unix.O_NONBLOCK, 0)
+				if e != nil {
 					return e
+				}
+				e = walk(child, path.Join(name, v.Name()))
+				ce := child.Close()
+				if e != nil {
+					return e
+				}
+				if ce != nil {
+					return ce
 				}
 			}
 			return nil
@@ -196,21 +355,7 @@ func Archive(root, src string, w io.Writer) error {
 		_, e = io.CopyN(tw, f, st.Size())
 		return e
 	}
-	f, e := open(fd, src, unix.O_RDONLY, 0)
-	if e != nil {
-		return e
-	}
-	st, e := f.Stat()
-	f.Close()
-	if e != nil {
-		return e
-	}
-	if st.IsDir() {
-		e = walk(src, ".")
-	} else {
-		e = walk(src, path.Base(src))
-	}
-	if e != nil {
+	if e := walk(source, sourceName); e != nil {
 		return e
 	}
 	return tw.Close()

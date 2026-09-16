@@ -213,7 +213,8 @@ func DNS(ctx context.Context, ip, upstream string) (func(), error) {
 		return nil, e
 	}
 	stop := func() { udp.Close(); tcp.Close() }
-	go serveUDP(ctx, udp, upstream)
-	go serveTCP(ctx, tcp, upstream)
+	admission := newDNSAdmission()
+	go serveUDP(ctx, udp, upstream, admission)
+	go serveTCP(ctx, tcp, upstream, admission)
 	return stop, nil
 }

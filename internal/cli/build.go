@@ -2,7 +2,6 @@ package cli
 
 import (
 	"crypto/ed25519"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"github.com/spf13/cobra"
@@ -30,6 +29,12 @@ func BuildArgs(endpoint, contextDir, dockerfile, output, target string, args []s
 	}
 	return out
 }
+
+func withinExportedRoot(root, name string) bool {
+	rel, e := filepath.Rel(root, name)
+	return e == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
 func (a *App) buildCommand(isBase bool) *cobra.Command {
 	var tag, file, target, recipe, keyPath, keyID, kernel, fcVersion string
 	var buildArgs []string
@@ -59,13 +64,32 @@ func (a *App) buildCommand(isBase bool) *cobra.Command {
 		if isBase && packager == "" {
 			return fmt.Errorf("set NIFLHEL_BASE_PACKAGER to an isolated packaging-worker wrapper")
 		}
-		tmp, e := os.MkdirTemp("", "niflhel-build-")
+		var tmp string
+		if isBase {
+			tmp, e = privateBuildTemp()
+		} else {
+			tmp, e = os.MkdirTemp("", "niflhel-build-")
+		}
 		if e != nil {
 			return e
 		}
-		defer os.RemoveAll(tmp)
+		if isBase {
+			defer removeBuildTemp(tmp)
+		} else {
+			defer os.RemoveAll(tmp)
+		}
+		var key ed25519.PrivateKey
+		buildContext, buildDockerfile := contextDir, df
+		if isBase {
+			var roots []string
+			key, roots, e = prepareBaseBuild(keyPath, tmp, contextDir, filepath.Dir(df))
+			if e != nil {
+				return e
+			}
+			buildContext, buildDockerfile = roots[0], filepath.Join(roots[1], filepath.Base(df))
+		}
 		output := filepath.Join(tmp, "image.tar")
-		bargs := BuildArgs(endpoint, contextDir, df, output, target, buildArgs)
+		bargs := BuildArgs(endpoint, buildContext, buildDockerfile, output, target, buildArgs)
 		if strings.HasPrefix(endpoint, "tcp://") {
 			tlsArgs := []string{}
 			for _, pair := range [][2]string{{"BUILDKIT_TLS_CA_CERT", "--tlscacert"}, {"BUILDKIT_TLS_CERT", "--tlscert"}, {"BUILDKIT_TLS_KEY", "--tlskey"}} {
@@ -144,15 +168,7 @@ func (a *App) buildCommand(isBase bool) *cobra.Command {
 		if e != nil {
 			return e
 		}
-		keyBytes, e := os.ReadFile(keyPath)
-		if e != nil {
-			return e
-		}
-		key, e := base64.StdEncoding.DecodeString(strings.TrimSpace(string(keyBytes)))
-		if e != nil {
-			return e
-		}
-		signed, e := base.Sign(base.Config{SchemaVersion: 1, OS: "linux", Architecture: "amd64", AgentProtocol: 1, InitPath: "/sbin/niflhel-init", Runtime: "runc", GuestReserveMiB: 128, FirecrackerVersions: []string{fcVersion}, Kernel: kd, RootFS: rd}, keyID, ed25519.PrivateKey(key))
+		signed, e := base.Sign(base.Config{SchemaVersion: 1, OS: "linux", Architecture: "amd64", AgentProtocol: 1, InitPath: "/sbin/niflhel-init", Runtime: "runc", GuestReserveMiB: 128, FirecrackerVersions: []string{fcVersion}, Kernel: kd, RootFS: rd}, keyID, key)
 		if e != nil {
 			return e
 		}
@@ -177,8 +193,13 @@ func (a *App) buildCommand(isBase bool) *cobra.Command {
 	c.Flags().StringVar(&target, "target", "", "build target")
 	c.Flags().StringArrayVar(&buildArgs, "build-arg", nil, "KEY=VALUE build argument")
 	if isBase {
+		c.Long = "Build and validate a signed VM base using an isolated packaging worker.\n\n" +
+			"BuildKit receives private copies of the context and Dockerfile directory, each\n" +
+			"limited to 512 MiB, 10,000 entries and 128 directory levels before .dockerignore.\n" +
+			"Symlinks must be relative and resolve within their local root. Special files\n" +
+			"are rejected. Staging uses protected /tmp, ignoring TMPDIR."
 		c.Flags().StringVar(&recipe, "config", "base.yaml", "base recipe")
-		c.Flags().StringVar(&keyPath, "signing-key", "", "base64 Ed25519 private-key file")
+		c.Flags().StringVar(&keyPath, "signing-key", "", "base64 Ed25519 private-key file outside both BuildKit local roots")
 		c.Flags().StringVar(&keyID, "key-id", "", "trusted publisher key ID")
 		c.Flags().StringVar(&kernel, "kernel", "", "local kernel supplied to packaging worker")
 		c.Flags().StringVar(&fcVersion, "firecracker-version", "", "qualified Firecracker version")

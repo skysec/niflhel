@@ -21,7 +21,11 @@ type result struct {
 	Name string
 }
 
+const resultRetention = 24 * time.Hour
+
 func (d *Daemon) saveResult(v api.Sandbox, exit *api.Exit) error {
+	d.resultMu.Lock()
+	defer d.resultMu.Unlock()
 	dir := filepath.Join(d.Config.Root, "results")
 	if e := os.MkdirAll(dir, 0700); e != nil {
 		return e
@@ -36,7 +40,7 @@ func (d *Daemon) saveResult(v api.Sandbox, exit *api.Exit) error {
 	if e := fsutil.JSON(filepath.Join(dir, v.ID+".json"), result{Exit: *exit, ID: v.ID, Name: v.Name}); e != nil {
 		return e
 	}
-	d.pruneResults()
+	d.pruneResultsLocked(time.Now())
 	return nil
 }
 func (d *Daemon) findResult(id string) (result, error) {
@@ -44,6 +48,10 @@ func (d *Daemon) findResult(id string) (result, error) {
 	if !api.ValidName(id) {
 		return found, state.ErrNotFound
 	}
+	d.resultMu.Lock()
+	defer d.resultMu.Unlock()
+	now := time.Now()
+	d.pruneResultsLocked(now)
 	entries, e := os.ReadDir(filepath.Join(d.Config.Root, "results"))
 	if e != nil {
 		return found, state.ErrNotFound
@@ -51,6 +59,10 @@ func (d *Daemon) findResult(id string) (result, error) {
 	matches := 0
 	for _, entry := range entries {
 		if !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		info, e := entry.Info()
+		if e != nil || !info.Mode().IsRegular() || now.Sub(info.ModTime()) >= resultRetention {
 			continue
 		}
 		var v result
@@ -74,6 +86,11 @@ func (d *Daemon) findResult(id string) (result, error) {
 	return found, state.ErrNotFound
 }
 func (d *Daemon) pruneResults() {
+	d.resultMu.Lock()
+	defer d.resultMu.Unlock()
+	d.pruneResultsLocked(time.Now())
+}
+func (d *Daemon) pruneResultsLocked(now time.Time) {
 	dir := filepath.Join(d.Config.Root, "results")
 	entries, e := os.ReadDir(dir)
 	if e != nil {
@@ -106,7 +123,7 @@ func (d *Daemon) pruneResults() {
 	}
 	sort.Slice(all, func(i, j int) bool { return all[i].at.Before(all[j].at) })
 	for i, v := range all {
-		if time.Since(v.at) < 24*time.Hour && total <= 256<<20 && len(all)-i <= 128 {
+		if now.Sub(v.at) < resultRetention && total <= 256<<20 && len(all)-i <= 128 {
 			break
 		}
 		for _, ext := range []string{".json", ".log", ".log.1"} {

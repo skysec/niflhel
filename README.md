@@ -90,7 +90,7 @@ Use `sudo niflhel` when the current user does not have socket access. `NIFLHEL_S
 
 `--memory` limits application memory; the guest adds the base's infrastructure reserve and the host bounds VMM overhead. `--cpus` accepts whole numbers. `--network none` omits the data NIC while exec still uses authenticated vsock.
 
-Bridge mode supplies public IPv4 NAT, a fixed-upstream DNS forwarder, explicit TCP publication, and host/private/metadata/peer isolation. Port publication defaults to loopback; `-p 0.0.0.0:8080:80` publishes externally. IPv6 is blocked. Phase one does not implement website filtering.
+Bridge mode supplies public IPv4 NAT, a fixed-upstream DNS forwarder, explicit TCP publication, and host/private/metadata/peer isolation. DNS forwarding admits a burst of 512 queries per sandbox and 8,192 process-wide, then limits forwarding to 256 queries/second per sandbox and 4,096 process-wide, with 64 concurrent queries per sandbox and 256 process-wide. Port publication defaults to loopback; `-p 0.0.0.0:8080:80` publishes externally. IPv6 is blocked. Phase one does not implement website filtering.
 
 ## Files and volumes
 
@@ -105,7 +105,7 @@ niflhel rm -f dev
 niflhel volume rm workspace
 ```
 
-Writable roots persist across stop/start and are deleted by rm. Named volumes survive container removal and are exclusive to one live sandbox. Writable disks reserve their physical capacity rather than overcommit host free space. Live host bind mounts are unsupported.
+Writable roots persist across stop/start and are deleted by rm. Named volumes survive container removal and are exclusive to one active sandbox. A failed sandbox retains its volume and VM-memory reservations when VMM termination or cleanup was not confirmed; recovery or `rm` releases them only after confirming cleanup. Writable disks reserve their physical capacity rather than overcommit host free space. Live host bind mounts are unsupported.
 
 In this release, `cp` copies regular files/directories **into a destination directory**, requires a running container, and rejects symlinks/special files. Transfers are capped at 512 MiB and 10,000 entries. This is a narrower contract than Docker's complete cp behavior.
 
@@ -119,7 +119,7 @@ niflhel build -f Dockerfile -t local/my-agent:dev .
 niflhel run --rm local/my-agent:dev
 ```
 
-For TCP BuildKit endpoints, configure `BUILDKIT_TLS_CA_CERT`, `BUILDKIT_TLS_CERT`, and `BUILDKIT_TLS_KEY`. Build arguments are passed as literal argv, and BuildKit handles Dockerfile stages and .dockerignore. OCI-layout build/load archives share the 512 MiB transfer limit; registry pulls allow larger images.
+For TCP BuildKit endpoints, configure `BUILDKIT_TLS_CA_CERT`, `BUILDKIT_TLS_CERT`, and `BUILDKIT_TLS_KEY`. Build arguments are passed as literal argv, and BuildKit handles Dockerfile stages and .dockerignore. OCI-layout build/load archives share the 512 MiB transfer limit; index, manifest, and application-config metadata are each limited to 4 MiB before privileged parsing. Registry pulls allow larger layer data while applying the same metadata limit.
 
 Existing Docker credential helpers are used for registry pulls. For niflhel-managed login/logout, set `NIFLHEL_CREDENTIAL_HELPER` to an installed helper such as `pass`:
 
@@ -134,7 +134,7 @@ Login reads the password from stdin and stores it through the helper. Registry c
 ## Build the first VM base
 
 1. Build the guest binary with `make guest`.
-2. Generate a publisher key: `bin/niflhel base keygen --output ./keys --key-id local`. Keep the generated private key on the publisher machine and add the printed public key to the service's `TrustedKeys`.
+2. Generate a publisher key outside every directory that will be exported to BuildKit: `bin/niflhel base keygen --output ../niflhel-signing-keys --key-id local`. Keep the generated private key on the publisher machine and add the printed public key to the service's `TrustedKeys`.
 3. Prepare an isolated Linux build worker with root privileges inside that worker, `mkfs.ext4`, and the built `niflhel-pack` installed at `/usr/local/bin/niflhel-pack`. Configure SSH access to that worker.
 4. Configure BuildKit and the packaging transport, then build using an approved amd64 ELF vmlinux:
 
@@ -146,7 +146,7 @@ export NIFLHEL_BASE_PACKAGER="$PWD/bin/niflhel-pack-ssh"
 niflhel base build -f images/base/Dockerfile \
   --config images/base/base.yaml \
   --kernel /path/to/approved/vmlinux \
-  --signing-key ./keys/publisher.key --key-id local \
+  --signing-key ../niflhel-signing-keys/publisher.key --key-id local \
   --firecracker-version 1.16.1 \
   -t registry.example.com/team/niflhel-base:1 .
 niflhel base push registry.example.com/team/niflhel-base:1
@@ -157,6 +157,10 @@ The Firecracker version is a declared qualification target, not a claim that eve
 Alternatively, replace the kernel reference in the recipe with an approved digest-pinned OCI image containing a **regular** `/boot/vmlinux`, and omit `--kernel`. Essential modules must be included in the rootfs if your kernel needs them.
 
 Base build runs the Dockerfile through BuildKit, packages its filesystem on the isolated worker, signs component descriptors locally, uploads it to the host cache, and runs a VM/exec/stop smoke validation. A failed validation leaves a staged artifact and reports failure. `niflhel base validate REFERENCE` reruns this check. The smoke image is `busybox:1.37`, pinned to its resolved digest during creation.
+
+The base-build command exports private copies of both BuildKit local roots, checking each opened source file against the pinned publisher key before copying. Root replacement and aliases added after staging cannot expose the key to BuildKit. Staging uses a private directory under root-owned, sticky-protected `/tmp`, ignoring `TMPDIR`, and is removed when the command returns.
+
+Each local root is limited to 512 MiB, 10,000 entries and 128 directory levels before `.dockerignore` filtering. Regular-file and directory permission bits are preserved; relative symlinks must resolve within their staged root. Absolute, escaping, dangling or cyclic symlinks and special files are rejected. Keep the key outside both original local roots and keep its directory protected; processes with the publisher's own account privileges remain trusted.
 
 The SSH packager transfers rootfs/kernel data, never the publisher key or host service socket. `NIFLHEL_ISOLATED_BUILD_WORKER=1` is an explicit worker-operation guard, not an isolation mechanism by itself. Release builders should pin the guest distro/package sources and runtime binaries rather than rely on the example Dockerfile's floating distribution tag.
 
