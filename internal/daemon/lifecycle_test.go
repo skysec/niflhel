@@ -188,4 +188,53 @@ func TestResultIdentityAndRetention(t *testing.T) {
 	if _, e := d.findResult("../../escape"); e == nil {
 		t.Fatal("unsafe result lookup accepted")
 	}
+	old := time.Now().Add(-resultRetention - time.Minute)
+	for _, ext := range []string{".json", ".log"} {
+		if e := os.Chtimes(filepath.Join(d.Config.Root, "results", v.ID+ext), old, old); e != nil {
+			t.Fatal(e)
+		}
+	}
+	if _, e := d.findResult(v.ID); e == nil {
+		t.Fatal("expired result remained readable")
+	}
+	for _, ext := range []string{".json", ".log"} {
+		if _, e := os.Stat(filepath.Join(d.Config.Root, "results", v.ID+ext)); !os.IsNotExist(e) {
+			t.Fatal("expired result artifact was not pruned", ext, e)
+		}
+	}
+}
+
+func TestExpiredResultsPrunedAtStartup(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "results")
+	if e := os.MkdirAll(dir, 0700); e != nil {
+		t.Fatal(e)
+	}
+	id := api.ID()
+	code := 0
+	if e := fsutil.JSON(filepath.Join(dir, id+".json"), result{Exit: api.Exit{Code: &code}, ID: id, Name: "expired"}); e != nil {
+		t.Fatal(e)
+	}
+	if e := os.WriteFile(filepath.Join(dir, id+".log"), []byte("secret"), 0600); e != nil {
+		t.Fatal(e)
+	}
+	old := time.Now().Add(-resultRetention - time.Minute)
+	for _, ext := range []string{".json", ".log"} {
+		if e := os.Chtimes(filepath.Join(dir, id+ext), old, old); e != nil {
+			t.Fatal(e)
+		}
+	}
+	cfg := DefaultConfig()
+	cfg.Root = root
+	cfg.Socket = filepath.Join(root, "socket")
+	d, e := New(cfg)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer d.Close()
+	for _, ext := range []string{".json", ".log"} {
+		if _, e := os.Stat(filepath.Join(dir, id+ext)); !os.IsNotExist(e) {
+			t.Fatal("startup retained expired artifact", ext, e)
+		}
+	}
 }

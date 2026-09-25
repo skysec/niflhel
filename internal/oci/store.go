@@ -79,26 +79,61 @@ func (s *Store) Pull(ctx context.Context, ref, policy string, auth *authn.AuthCo
 	if e != nil {
 		return Image{}, e
 	}
-	opts := []remote.Option{remote.WithContext(ctx), remote.WithPlatform(v1.Platform{OS: "linux", Architecture: "amd64"}), remote.WithJobs(2)}
+	metadata := NewMetadataTransport(remote.DefaultTransport, MaxMetadata, 8*MaxMetadata)
+	opts := []remote.Option{remote.WithContext(ctx), remote.WithPlatform(v1.Platform{OS: "linux", Architecture: "amd64"}), remote.WithJobs(2), remote.WithTransport(metadata)}
 	if auth != nil {
 		opts = append(opts, remote.WithAuth(authn.FromConfig(*auth)))
 	}
+	stopMetadata := metadata.Limit()
 	img, e := remote.Image(n, opts...)
+	stopMetadata()
 	if e != nil {
 		return Image{}, e
 	}
-	return s.importImage(ctx, ref, img)
+	return s.importImage(ctx, ref, img, metadata)
 }
 func (s *Store) Import(ctx context.Context, ref string, img v1.Image) (Image, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.importImage(ctx, ref, img)
+	return s.importImage(ctx, ref, img, nil)
 }
-func (s *Store) importImage(ctx context.Context, ref string, img v1.Image) (Image, error) {
+func (s *Store) importImage(ctx context.Context, ref string, img v1.Image, metadata *MetadataTransport) (Image, error) {
 	var out Image
 	out.Ref = ref
-	cfg, e := img.ConfigFile()
+	limit := func() func() { return func() {} }
+	if metadata != nil {
+		limit = metadata.Limit
+	}
+	stopMetadata := limit()
+	raw, e := img.RawManifest()
+	stopMetadata()
 	if e != nil {
+		return out, e
+	}
+	if int64(len(raw)) > MaxMetadata {
+		return out, fmt.Errorf("invalid image manifest")
+	}
+	var manifest v1.Manifest
+	if e = decodeMetadata(raw, &manifest); e != nil {
+		return out, e
+	}
+	if manifest.Config.Size < 0 || manifest.Config.Size > MaxMetadata {
+		return out, fmt.Errorf("image config descriptor size limit exceeded")
+	}
+	if _, e = fsutil.HexDigest(manifest.Config.Digest.String()); e != nil {
+		return out, e
+	}
+	stopMetadata = limit()
+	configRaw, e := img.RawConfigFile()
+	stopMetadata()
+	if e != nil {
+		return out, e
+	}
+	if int64(len(configRaw)) != manifest.Config.Size || fsutil.Digest(configRaw) != manifest.Config.Digest.String() {
+		return out, fmt.Errorf("image config descriptor integrity failure")
+	}
+	var cfg v1.ConfigFile
+	if e = decodeMetadata(configRaw, &cfg); e != nil {
 		return out, e
 	}
 	if cfg.OS != "linux" || cfg.Architecture != "amd64" {
@@ -113,11 +148,7 @@ func (s *Store) importImage(ctx context.Context, ref string, img v1.Image) (Imag
 		return out, e
 	}
 	out.Digest = digest.String()
-	raw, e := img.RawManifest()
-	if e != nil {
-		return out, e
-	}
-	if len(raw) > 4<<20 || fsutil.Digest(raw) != out.Digest {
+	if fsutil.Digest(raw) != out.Digest {
 		return out, fmt.Errorf("invalid image manifest")
 	}
 	out.Manifest = raw

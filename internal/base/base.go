@@ -2,6 +2,7 @@
 package base
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
@@ -22,6 +23,14 @@ import (
 )
 
 const ArtifactType = "application/vnd.niflhel.base.v1"
+
+const MaxSignedMetadata int64 = 1 << 20
+
+const (
+	maxSignedTokens      = 4096
+	maxSignedDepth       = 16
+	maxSignedStringBytes = 256 << 10
+)
 
 type Config struct {
 	SchemaVersion       int
@@ -88,6 +97,28 @@ func Sign(c Config, keyID string, key ed25519.PrivateKey) (Signed, error) {
 	}
 	return Signed{Config: c, KeyID: keyID, Signature: base64.StdEncoding.EncodeToString(ed25519.Sign(key, b))}, nil
 }
+
+// ParseSigned admits an untrusted signed envelope before the caller performs
+// publisher verification. Generated envelopes use this exact JSON schema.
+func ParseSigned(raw []byte) (Signed, error) {
+	var v Signed
+	if int64(len(raw)) > MaxSignedMetadata {
+		return v, fmt.Errorf("base signed metadata size limit exceeded")
+	}
+	if e := fsutil.ValidateJSONComplexity(raw, maxSignedTokens, maxSignedDepth, maxSignedStringBytes); e != nil {
+		return v, fmt.Errorf("invalid base signed metadata: %w", e)
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if e := dec.Decode(&v); e != nil {
+		return v, fmt.Errorf("invalid base signed metadata: %w", e)
+	}
+	if e := dec.Decode(&struct{}{}); e != io.EOF {
+		return v, fmt.Errorf("invalid base signed metadata")
+	}
+	return v, nil
+}
+
 func (s Store) Verify(v Signed) error {
 	if e := Validate(v.Config); e != nil {
 		return e
@@ -97,8 +128,8 @@ func (s Store) Verify(v Signed) error {
 		return fmt.Errorf("untrusted base publisher %q", v.KeyID)
 	}
 	sig, e := base64.StdEncoding.DecodeString(v.Signature)
-	if e != nil {
-		return e
+	if e != nil || len(sig) != ed25519.SignatureSize || v.Signature != base64.StdEncoding.EncodeToString(sig) {
+		return fmt.Errorf("invalid base signature encoding")
 	}
 	b, _ := json.Marshal(v.Config)
 	if !ed25519.Verify(ed25519.PublicKey(pub), b, sig) {
@@ -210,16 +241,22 @@ func (s Store) Pull(ctx context.Context, ref, policy string, auth *authn.AuthCon
 	if e != nil {
 		return Bundle{}, e
 	}
-	opts := []remote.Option{remote.WithContext(ctx)}
+	metadata := oci.NewMetadataTransport(remote.DefaultTransport, MaxSignedMetadata, 8*MaxSignedMetadata)
+	opts := []remote.Option{remote.WithContext(ctx), remote.WithTransport(metadata)}
 	if auth != nil {
 		opts = append(opts, remote.WithAuth(authn.FromConfig(*auth)))
 	}
+	stopMetadata := metadata.Limit()
 	desc, e := remote.Get(n, opts...)
+	stopMetadata()
 	if e != nil {
 		return Bundle{}, e
 	}
-	if len(desc.Manifest) > 1<<20 {
+	if int64(len(desc.Manifest)) > MaxSignedMetadata {
 		return Bundle{}, fmt.Errorf("manifest too large")
+	}
+	if e = fsutil.ValidateJSONComplexity(desc.Manifest, maxSignedTokens, maxSignedDepth, maxSignedStringBytes); e != nil {
+		return Bundle{}, fmt.Errorf("invalid base manifest: %w", e)
 	}
 	var m manifest
 	if e = json.Unmarshal(desc.Manifest, &m); e != nil {
@@ -228,7 +265,7 @@ func (s Store) Pull(ctx context.Context, ref, policy string, auth *authn.AuthCon
 	if m.ArtifactType != ArtifactType || m.SchemaVersion != 2 || len(m.Layers) != 2 {
 		return Bundle{}, fmt.Errorf("not a niflhel base artifact")
 	}
-	if m.Config.Size <= 0 || m.Config.Size > 1<<20 {
+	if m.Config.Size <= 0 || m.Config.Size > MaxSignedMetadata {
 		return Bundle{}, fmt.Errorf("invalid base config size")
 	}
 	readBlob := func(d descriptor) (io.ReadCloser, error) {
@@ -241,20 +278,23 @@ func (s Store) Pull(ctx context.Context, ref, policy string, auth *authn.AuthCon
 		}
 		return l.Compressed()
 	}
+	stopMetadata = metadata.Limit()
 	r, e := readBlob(m.Config)
 	if e != nil {
+		stopMetadata()
 		return Bundle{}, e
 	}
 	raw, e := io.ReadAll(io.LimitReader(r, m.Config.Size+1))
 	r.Close()
+	stopMetadata()
 	if e != nil {
 		return Bundle{}, e
 	}
 	if int64(len(raw)) != m.Config.Size || fsutil.Digest(raw) != m.Config.Digest {
 		return Bundle{}, fmt.Errorf("base config integrity failure")
 	}
-	var signed Signed
-	if e = json.Unmarshal(raw, &signed); e != nil {
+	signed, e := ParseSigned(raw)
+	if e != nil {
 		return Bundle{}, e
 	}
 	if e = s.Verify(signed); e != nil {

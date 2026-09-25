@@ -8,7 +8,6 @@ import (
 	"flag"
 	"fmt"
 	"github.com/google/go-containerregistry/pkg/name"
-	"github.com/google/go-containerregistry/pkg/v1/layout"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"io"
@@ -20,7 +19,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
+
+const kernelImageTimeout = 10 * time.Minute
 
 func main() {
 	if e := run(); e != nil {
@@ -60,22 +62,7 @@ func run() error {
 	if e != nil {
 		return e
 	}
-	lp, e := layout.FromPath(layoutDir)
-	if e != nil {
-		return e
-	}
-	idx, e := lp.ImageIndex()
-	if e != nil {
-		return e
-	}
-	manifest, e := idx.IndexManifest()
-	if e != nil {
-		return e
-	}
-	if len(manifest.Manifests) != 1 {
-		return fmt.Errorf("one platform required")
-	}
-	image, e := lp.Image(manifest.Manifests[0].Digest)
+	image, e := oci.LoadLayoutImage(layoutDir)
 	if e != nil {
 		return e
 	}
@@ -122,50 +109,8 @@ func run() error {
 		if e != nil {
 			return e
 		}
-	} else {
-		if !strings.Contains(*kernelImage, "@sha256:") {
-			return fmt.Errorf("kernel image must be digest-pinned")
-		}
-		ref, e := name.ParseReference(*kernelImage)
-		if e != nil {
-			return e
-		}
-		img, e := remote.Image(ref, remote.WithContext(ctx))
-		if e != nil {
-			return e
-		}
-		r := mutate.Extract(img)
-		defer r.Close()
-		tr := tar.NewReader(io.LimitReader(r, 512*api.MiB))
-		found := false
-		for {
-			h, e := tr.Next()
-			if e == io.EOF {
-				break
-			}
-			if e != nil {
-				return e
-			}
-			if strings.TrimPrefix(h.Name, "./") == "boot/vmlinux" {
-				if h.Typeflag != tar.TypeReg || h.Size > 128*api.MiB {
-					return fmt.Errorf("kernel must be regular /boot/vmlinux under 128 MiB")
-				}
-				dst, e := os.OpenFile(outKernel, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-				if e != nil {
-					return e
-				}
-				_, e = io.CopyN(dst, tr, h.Size)
-				dst.Close()
-				if e != nil {
-					return e
-				}
-				found = true
-				break
-			}
-		}
-		if !found {
-			return fmt.Errorf("kernel image lacks regular /boot/vmlinux")
-		}
+	} else if e = writeKernelFromImage(ctx, *kernelImage, outKernel); e != nil {
+		return e
 	}
 	size := int64(0)
 	filepath.Walk(root, func(_ string, i os.FileInfo, e error) error {
@@ -175,4 +120,48 @@ func run() error {
 		return e
 	})
 	return (storage.Manager{}).Disk(ctx, filepath.Join(*output, "rootfs.ext4"), storage.CarrierSize(size), root)
+}
+
+func writeKernelFromImage(ctx context.Context, imageRef, outKernel string) error {
+	if !strings.Contains(imageRef, "@sha256:") {
+		return fmt.Errorf("kernel image must be digest-pinned")
+	}
+	ref, e := name.ParseReference(imageRef)
+	if e != nil {
+		return e
+	}
+	ctx, cancel := context.WithTimeout(ctx, kernelImageTimeout)
+	defer cancel()
+	metadata := oci.NewMetadataTransport(remote.DefaultTransport, oci.MaxMetadata, 8*oci.MaxMetadata)
+	stopMetadata := metadata.Limit()
+	img, e := remote.Image(ref, remote.WithContext(ctx), remote.WithTransport(metadata))
+	stopMetadata()
+	if e != nil {
+		return e
+	}
+	r := mutate.Extract(img)
+	defer r.Close()
+	tr := tar.NewReader(io.LimitReader(r, 512*api.MiB))
+	for {
+		h, e := tr.Next()
+		if e == io.EOF {
+			return fmt.Errorf("kernel image lacks regular /boot/vmlinux")
+		}
+		if e != nil {
+			return e
+		}
+		if strings.TrimPrefix(h.Name, "./") != "boot/vmlinux" {
+			continue
+		}
+		if h.Typeflag != tar.TypeReg || h.Size > 128*api.MiB {
+			return fmt.Errorf("kernel must be regular /boot/vmlinux under 128 MiB")
+		}
+		dst, e := os.OpenFile(outKernel, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		if e != nil {
+			return e
+		}
+		_, e = io.CopyN(dst, tr, h.Size)
+		dst.Close()
+		return e
+	}
 }

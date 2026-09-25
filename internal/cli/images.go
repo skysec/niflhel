@@ -10,7 +10,6 @@ import (
 	"niflhel/internal/daemon"
 	"niflhel/internal/filecopy"
 	"os"
-	"path/filepath"
 	"strings"
 )
 
@@ -140,16 +139,11 @@ func (a *App) copyCommand() *cobra.Command {
 			return fmt.Errorf("exactly one path must be CONTAINER:/path")
 		}
 		if dremote {
-			source, e := filepath.Abs(args[0])
+			source, e := filecopy.OpenArchiveSource(args[0])
 			if e != nil {
 				return e
 			}
-			parent := filepath.Dir(source)
-			name := filepath.Base(source)
-			if st, e := os.Stat(source); e == nil && st.IsDir() {
-				parent = source
-				name = "."
-			}
+			defer source.Close()
 			s, e := a.client().Session(c.Context(), api.Request{Action: "copy-in", ID: did, Path: dst})
 			if e != nil {
 				return e
@@ -157,7 +151,7 @@ func (a *App) copyCommand() *cobra.Command {
 			defer s.Close()
 			done := make(chan error, 1)
 			go func() {
-				e := filecopy.Archive(parent, name, sessionDataWriter{s})
+				e := source.ArchiveTo(sessionDataWriter{s})
 				if e == nil {
 					e = s.Send(api.Frame{Type: "eof"})
 				}
@@ -175,13 +169,11 @@ func (a *App) copyCommand() *cobra.Command {
 			}
 			return <-done
 		}
-		dest, e := filepath.Abs(args[1])
+		dest, e := filecopy.OpenDestinationRoot(args[1])
 		if e != nil {
 			return e
 		}
-		if e = os.MkdirAll(dest, 0755); e != nil {
-			return e
-		}
+		defer dest.Close()
 		s, e := a.client().Session(c.Context(), api.Request{Action: "copy-out", ID: sid, Path: src})
 		if e != nil {
 			return e
@@ -213,7 +205,7 @@ func (a *App) copyCommand() *cobra.Command {
 				}
 			}
 		}()
-		return filecopy.Extract(dest, ".", r)
+		return filecopy.ExtractRoot(dest, ".", r)
 	}}
 }
 

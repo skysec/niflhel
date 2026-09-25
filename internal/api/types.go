@@ -326,6 +326,9 @@ type Sandbox struct {
 	PIDStart    string
 	GuestMemory int64
 	Slot        int
+	// VMResourcesReleased is false by default so legacy failed records remain
+	// quarantined until recovery or removal confirms VMM cleanup.
+	VMResourcesReleased bool
 }
 type Volume struct {
 	Name    string

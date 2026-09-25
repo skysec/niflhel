@@ -29,6 +29,7 @@ type Manager struct {
 	Firecracker string
 	Jailer      string
 	Storage     storage.Manager
+	procRoot    string
 }
 type Drive struct {
 	ID       string `json:"drive_id"`
@@ -216,7 +217,19 @@ func (m Manager) Start(ctx context.Context, s api.Sandbox, b base.Bundle) (int, 
 	return pid, start, nil
 }
 func PIDStart(pid int) (string, error) {
-	b, e := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	return pidStartAt("/proc", pid)
+}
+
+func pidStartAt(procRoot string, pid int) (string, error) {
+	bootRaw, e := os.ReadFile(filepath.Join(procRoot, "sys/kernel/random/boot_id"))
+	if e != nil {
+		return "", e
+	}
+	bootID := strings.TrimSpace(string(bootRaw))
+	if bootID == "" || strings.Contains(bootID, ":") {
+		return "", fmt.Errorf("malformed host boot ID")
+	}
+	b, e := os.ReadFile(filepath.Join(procRoot, strconv.Itoa(pid), "stat"))
 	if e != nil {
 		return "", e
 	}
@@ -228,22 +241,78 @@ func PIDStart(pid int) (string, error) {
 	if len(p) < 20 {
 		return "", fmt.Errorf("malformed process stat")
 	}
-	return p[19], nil
+	return bootID + ":" + p[19], nil
+}
+
+func cgroupOwnedAt(procRoot string, s api.Sandbox) (bool, error) {
+	group, e := os.ReadFile(filepath.Join(procRoot, strconv.Itoa(s.PID), "cgroup"))
+	if os.IsNotExist(e) {
+		return false, nil
+	}
+	if e != nil {
+		return false, e
+	}
+	want := "/niflhel/" + s.ID
+	for _, line := range strings.Split(string(group), "\n") {
+		parts := strings.SplitN(line, ":", 3)
+		if len(parts) == 3 && parts[2] == want {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func aliveAt(procRoot string, s api.Sandbox) bool {
+	if s.PID <= 1 || s.PIDStart == "" {
+		return false
+	}
+	current, e := pidStartAt(procRoot, s.PID)
+	if e != nil {
+		return false
+	}
+	identityMatches := current == s.PIDStart
+	// Legacy records stored only boot-relative ticks. They remain usable on
+	// the current boot, but never without the sandbox's exact owned cgroup.
+	if !identityMatches && !strings.Contains(s.PIDStart, ":") && strings.HasSuffix(current, ":"+s.PIDStart) {
+		identityMatches = true
+	}
+	if !identityMatches {
+		return false
+	}
+	owned, e := cgroupOwnedAt(procRoot, s)
+	return e == nil && owned
 }
 func Alive(s api.Sandbox) bool {
-	v, e := PIDStart(s.PID)
-	return e == nil && v == s.PIDStart && s.PID > 1 && s.PIDStart != ""
+	return aliveAt("/proc", s)
+}
+
+func (m Manager) processRoot() string {
+	if m.procRoot != "" {
+		return m.procRoot
+	}
+	return "/proc"
+}
+
+func (m Manager) ownedAlive(s api.Sandbox) (bool, error) {
+	if !aliveAt(m.processRoot(), s) {
+		return false, nil
+	}
+	// Re-read the cgroup at destructive call sites to narrow the race between
+	// identity admission and pidfd acquisition/signaling.
+	return cgroupOwnedAt(m.processRoot(), s)
 }
 func (m Manager) Kill(ctx context.Context, s api.Sandbox) error {
-	if !Alive(s) {
-		discovered, e := m.Discover(s)
-		if e != nil {
-			return e
-		}
-		s = discovered
-		if !Alive(s) {
-			return nil
-		}
+	discovered, e := m.Discover(s)
+	if e != nil {
+		return e
+	}
+	s = discovered
+	owned, e := m.ownedAlive(s)
+	if e != nil {
+		return e
+	}
+	if !owned {
+		return nil
 	}
 	fd, e := unix.PidfdOpen(s.PID, 0)
 	if e == unix.ESRCH {
@@ -253,7 +322,11 @@ func (m Manager) Kill(ctx context.Context, s api.Sandbox) error {
 		return e
 	}
 	defer unix.Close(fd)
-	if !Alive(s) {
+	owned, e = m.ownedAlive(s)
+	if e != nil {
+		return e
+	}
+	if !owned {
 		return nil
 	}
 	if e = unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0); e != nil && e != unix.ESRCH {
@@ -345,11 +418,16 @@ func (m Manager) Remove(s api.Sandbox) error {
 // Discover closes the crash window between launching the jailer and committing
 // its PID. Only a PID in the exact owned cgroup can be adopted from the pidfile.
 func (m Manager) Discover(s api.Sandbox) (api.Sandbox, error) {
-	if Alive(s) {
+	owned, e := m.ownedAlive(s)
+	if e != nil {
+		return s, e
+	}
+	if owned {
 		return s, nil
 	}
 	raw, e := os.ReadFile(filepath.Join(m.Jail(s.ID), filepath.Base(m.Firecracker)+".pid"))
 	if os.IsNotExist(e) {
+		s.PID, s.PIDStart = 0, ""
 		return s, nil
 	}
 	if e != nil {
@@ -359,27 +437,22 @@ func (m Manager) Discover(s api.Sandbox) (api.Sandbox, error) {
 	if e != nil || pid < 2 {
 		return s, fmt.Errorf("invalid jailer PID record")
 	}
-	group, e := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
-	if os.IsNotExist(e) {
-		return s, nil
-	}
+	start, e := pidStartAt(m.processRoot(), pid)
 	if e != nil {
-		return s, e
-	}
-	owned := false
-	for _, line := range strings.Split(string(group), "\n") {
-		if strings.HasSuffix(line, ":/niflhel/"+s.ID) {
-			owned = true
+		if os.IsNotExist(e) {
+			s.PID, s.PIDStart = 0, ""
+			return s, nil
 		}
-	}
-	if !owned {
-		return s, nil
-	}
-	start, e := PIDStart(pid)
-	if e != nil {
 		return s, e
 	}
 	s.PID = pid
 	s.PIDStart = start
+	owned, e = m.ownedAlive(s)
+	if e != nil {
+		return s, e
+	}
+	if !owned {
+		s.PID, s.PIDStart = 0, ""
+	}
 	return s, nil
 }

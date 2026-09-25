@@ -47,6 +47,7 @@ type Daemon struct {
 	VM       Backend
 	Network  Network
 	mu       sync.Mutex
+	resultMu sync.Mutex
 	locks    map[string]*sync.Mutex
 	monitors map[string]int
 	dns      map[string]func()
@@ -70,6 +71,21 @@ func New(c Config) (*Daemon, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	disk := storage.Manager{Root: c.Root}
 	d := &Daemon{Config: c, Store: s, Images: oci.New(filepath.Join(c.Root, "images")), Bases: base.Store{Root: filepath.Join(c.Root, "bases"), Trust: c.TrustedKeys}, Storage: disk, VM: firecracker.Manager{Root: c.Root, Firecracker: c.Firecracker, Jailer: c.Jailer, Storage: disk}, Network: network.Manager{}, locks: map[string]*sync.Mutex{}, monitors: map[string]int{}, dns: map[string]func(){}, ports: map[string][]net.Listener{}, ctx: ctx, cancel: cancel}
+	d.pruneResults()
+	d.wg.Add(1)
+	go func() {
+		defer d.wg.Done()
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-d.ctx.Done():
+				return
+			case <-ticker.C:
+				d.pruneResults()
+			}
+		}
+	}()
 	return d, nil
 }
 func (d *Daemon) Close() error {
@@ -99,6 +115,16 @@ func (d *Daemon) lock(id string) func() {
 	return m.Unlock
 }
 func (d *Daemon) dir(id string) string { return filepath.Join(d.Config.Root, "sandboxes", id) }
+func reservesVMResources(v api.Sandbox) bool {
+	switch v.State {
+	case "starting", "running", "stopping":
+		return true
+	case "failed":
+		return !v.VMResourcesReleased
+	default:
+		return false
+	}
+}
 func (d *Daemon) Create(ctx context.Context, s api.Spec, auth Auth) (api.Sandbox, error) {
 	var v api.Sandbox
 	if e := s.Validate(); e != nil {
@@ -148,7 +174,7 @@ func (d *Daemon) Create(ctx context.Context, s api.Spec, auth Auth) (api.Sandbox
 		s.Name = "nf-" + id[:12]
 	}
 	now := time.Now().UTC()
-	v = api.Sandbox{ID: id, Name: s.Name, Spec: s, State: "creating", Slot: slot, Created: now, Updated: now}
+	v = api.Sandbox{ID: id, Name: s.Name, Spec: s, State: "creating", Slot: slot, Created: now, Updated: now, VMResourcesReleased: true}
 	if e = d.Store.Create(v); e != nil {
 		return v, e
 	}
@@ -238,21 +264,21 @@ func (d *Daemon) Start(ctx context.Context, id string) (api.Sandbox, error) {
 		return v, e
 	}
 	for _, x := range all {
-		if x.ID == v.ID || !(x.State == "running" || x.State == "starting" || x.State == "stopping") {
+		if x.ID == v.ID || !reservesVMResources(x) {
 			continue
 		}
 		for _, m := range v.Spec.Mounts {
 			for _, n := range x.Spec.Mounts {
 				if m.Name == n.Name {
 					alloc()
-					return v, fmt.Errorf("volume %s already attached to live sandbox", m.Name)
+					return v, fmt.Errorf("volume %s reserved by active or failed sandbox", m.Name)
 				}
 			}
 		}
 	}
 	reserved := v.GuestMemory + 64*api.MiB
 	for _, x := range all {
-		if x.State == "running" || x.State == "starting" || x.State == "stopping" {
+		if reservesVMResources(x) {
 			reserved += x.GuestMemory + 64*api.MiB
 		}
 	}
@@ -268,6 +294,7 @@ func (d *Daemon) Start(ctx context.Context, id string) (api.Sandbox, error) {
 	v.State = "starting"
 	v.Exit = nil
 	v.Reason = ""
+	v.VMResourcesReleased = false
 	e = d.Store.Update(v.ID, func(old *api.Sandbox) error { *old = v; return nil })
 	alloc()
 	if e != nil {
@@ -278,15 +305,21 @@ func (d *Daemon) Start(ctx context.Context, id string) (api.Sandbox, error) {
 	fail := func(err error) (api.Sandbox, error) {
 		cleanupCtx, cc := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cc()
+		released := false
+		reason := err.Error()
 		if killErr := d.VM.Kill(cleanupCtx, v); killErr == nil {
 			d.stopDNS(v.ID)
-			d.Network.Remove(cleanupCtx, v)
-			d.VM.Remove(v)
+			netErr := d.Network.Remove(cleanupCtx, v)
+			vmErr := d.VM.Remove(v)
+			released = netErr == nil && vmErr == nil
+		} else {
+			reason += "; VMM termination failed: " + killErr.Error()
 		}
 		d.Store.Update(v.ID, func(x *api.Sandbox) error {
 			x.PID = v.PID
 			x.PIDStart = v.PIDStart
-			return state.Transition(x, "failed", err.Error())
+			x.VMResourcesReleased = released
+			return state.Transition(x, "failed", reason)
 		})
 		return v, err
 	}
@@ -464,6 +497,7 @@ func (d *Daemon) finish(v api.Sandbox, exit *api.Exit) {
 		d.Store.Update(v.ID, func(s *api.Sandbox) error {
 			s.State = "failed"
 			s.Reason = "VMM termination failed: " + e.Error()
+			s.VMResourcesReleased = false
 			return nil
 		})
 		return
@@ -476,6 +510,7 @@ func (d *Daemon) finish(v api.Sandbox, exit *api.Exit) {
 		s.Exit = exit
 		s.PID = 0
 		s.PIDStart = ""
+		s.VMResourcesReleased = netErr == nil && vmErr == nil
 		if netErr != nil || vmErr != nil {
 			s.State = "failed"
 			s.Reason = fmt.Sprintf("cleanup failed: %v %v", netErr, vmErr)
@@ -599,16 +634,40 @@ func (d *Daemon) Recover() error {
 			}
 		case "creating", "starting", "removing":
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			released := false
 			if e = d.VM.Kill(ctx, v); e == nil {
-				d.Network.Remove(ctx, v)
-				d.VM.Remove(v)
+				netErr := d.Network.Remove(ctx, v)
+				vmErr := d.VM.Remove(v)
+				released = netErr == nil && vmErr == nil
 			}
 			cancel()
 			d.Store.Update(v.ID, func(s *api.Sandbox) error {
 				s.State = "failed"
 				s.Reason = "interrupted operation; remove and recreate"
+				s.VMResourcesReleased = released
 				return nil
 			})
+		case "failed":
+			if v.VMResourcesReleased {
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			released := false
+			if e = d.VM.Kill(ctx, v); e == nil {
+				d.stopDNS(v.ID)
+				netErr := d.Network.Remove(ctx, v)
+				vmErr := d.VM.Remove(v)
+				released = netErr == nil && vmErr == nil
+			}
+			cancel()
+			if released {
+				d.Store.Update(v.ID, func(s *api.Sandbox) error {
+					s.PID = 0
+					s.PIDStart = ""
+					s.VMResourcesReleased = true
+					return nil
+				})
+			}
 		}
 	}
 	return nil

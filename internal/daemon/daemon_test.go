@@ -7,7 +7,9 @@ import (
 	"niflhel/internal/base"
 	"niflhel/internal/wire"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 type fakeVM struct{ killErr error }
@@ -81,7 +83,106 @@ func TestInterruptedRecovery(t *testing.T) {
 		t.Fatal(e)
 	}
 	got, _ := d.Store.Get(v.ID)
-	if got.State != "failed" {
+	if got.State != "failed" || !got.VMResourcesReleased {
 		t.Fatal(got)
+	}
+}
+
+func TestFailedTerminationRetainsVMResourceReservation(t *testing.T) {
+	d := testDaemon(t)
+	seedArtifacts(t, d)
+	mount := api.Mount{Name: "shared", Target: "/data"}
+	holder := api.Sandbox{
+		ID: api.ID(), Name: "holder", State: "running", Generation: 1,
+		Spec: api.Spec{Mounts: []api.Mount{mount}}, GuestMemory: 128 * api.MiB,
+	}
+	candidate := api.Sandbox{
+		ID: api.ID(), Name: "candidate", State: "created", BaseDigest: "local/base:test",
+		Spec: api.Spec{Mounts: []api.Mount{mount}}, GuestMemory: 128 * api.MiB,
+	}
+	if e := d.Store.Create(holder); e != nil {
+		t.Fatal(e)
+	}
+	if e := d.Store.Create(candidate); e != nil {
+		t.Fatal(e)
+	}
+
+	d.VM = fakeVM{killErr: fmt.Errorf("cannot confirm VMM death")}
+	d.finish(holder, &api.Exit{Reason: "control lost", At: time.Now().UTC()})
+	got, e := d.Store.Get(holder.ID)
+	if e != nil || got.State != "failed" {
+		t.Fatal(got, e)
+	}
+	if got.VMResourcesReleased || !reservesVMResources(got) {
+		t.Fatal("unconfirmed termination released VM resources", got)
+	}
+	if e = d.Recover(); e != nil {
+		t.Fatal(e)
+	}
+	got, e = d.Store.Get(holder.ID)
+	if e != nil || got.VMResourcesReleased {
+		t.Fatal("recovery released resources without confirming termination", got, e)
+	}
+
+	d.VM = fakeVM{}
+	if _, e = d.Start(context.Background(), candidate.ID); e == nil || !strings.Contains(e.Error(), "volume shared") {
+		t.Fatalf("failed holder did not retain the volume reservation: %v", e)
+	}
+	if e = d.Remove(context.Background(), holder.ID, true); e != nil {
+		t.Fatal(e)
+	}
+	if _, e = d.Start(context.Background(), candidate.ID); e != nil && strings.Contains(e.Error(), "volume shared") {
+		t.Fatalf("confirmed removal did not release the volume reservation: %v", e)
+	}
+}
+
+func TestVMResourceReservationStates(t *testing.T) {
+	for _, tc := range []struct {
+		state    string
+		released bool
+		reserved bool
+	}{
+		{"creating", false, false}, {"created", false, false},
+		{"starting", false, true}, {"running", true, true},
+		{"stopping", false, true}, {"exited", false, false},
+		{"failed", false, true}, {"failed", true, false},
+		{"removing", false, false},
+	} {
+		v := api.Sandbox{State: tc.state, VMResourcesReleased: tc.released}
+		if got := reservesVMResources(v); got != tc.reserved {
+			t.Errorf("state %s: reserved=%v, want %v", tc.state, got, tc.reserved)
+		}
+	}
+}
+
+func TestConfirmedStartFailureReleasesVMResources(t *testing.T) {
+	d := testDaemon(t)
+	seedArtifacts(t, d)
+	mount := api.Mount{Name: "shared", Target: "/data"}
+	newSandbox := func(name string) api.Sandbox {
+		return api.Sandbox{
+			ID: api.ID(), Name: name, State: "created", BaseDigest: "local/base:test",
+			Spec: api.Spec{Mounts: []api.Mount{mount}}, GuestMemory: 128 * api.MiB,
+			VMResourcesReleased: true,
+		}
+	}
+	first := newSandbox("first")
+	if e := d.Store.Create(first); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := d.Start(context.Background(), first.ID); e == nil || !strings.Contains(e.Error(), "injected start failure") {
+		t.Fatalf("expected injected start failure, got %v", e)
+	}
+	got, e := d.Store.Get(first.ID)
+	if e != nil || got.State != "failed" || !got.VMResourcesReleased || reservesVMResources(got) {
+		t.Fatal("confirmed cleanup retained VM resources", got, e)
+	}
+
+	second := newSandbox("second")
+	if e = d.Store.Create(second); e != nil {
+		t.Fatal(e)
+	}
+	if _, e = d.Start(context.Background(), second.ID); e == nil || !strings.Contains(e.Error(), "injected start failure") {
+		t.Fatalf("confirmed-clean failed holder blocked sequential volume reuse: %v", e)
 	}
 }

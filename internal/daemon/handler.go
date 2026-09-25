@@ -4,13 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/google/go-containerregistry/pkg/v1/layout"
 	"io"
 	"niflhel/internal/api"
 	"niflhel/internal/base"
 	"niflhel/internal/filecopy"
 	"niflhel/internal/fsutil"
 	"niflhel/internal/journal"
+	"niflhel/internal/oci"
 	"niflhel/internal/wire"
 	"os"
 	"path/filepath"
@@ -250,22 +250,7 @@ func (d *Daemon) load(ctx context.Context, q api.Request, s *wire.Stream) error 
 		return e
 	}
 	if q.Action == "image-load" {
-		lp, e := layout.FromPath(tmp)
-		if e != nil {
-			return e
-		}
-		idx, e := lp.ImageIndex()
-		if e != nil {
-			return e
-		}
-		m, e := idx.IndexManifest()
-		if e != nil {
-			return e
-		}
-		if len(m.Manifests) != 1 {
-			return fmt.Errorf("build/load must contain exactly one platform image")
-		}
-		img, e := lp.Image(m.Manifests[0].Digest)
+		img, e := oci.LoadLayoutImage(tmp)
 		if e != nil {
 			return e
 		}
@@ -275,8 +260,12 @@ func (d *Daemon) load(ctx context.Context, q api.Request, s *wire.Stream) error 
 		}
 		return s.Send(api.Frame{Type: "exit", Message: v.Digest})
 	}
-	var signed base.Signed
-	if e = fsutil.ReadJSON(filepath.Join(tmp, "signed.json"), &signed); e != nil {
+	raw, e := fsutil.ReadFileLimit(filepath.Join(tmp, "signed.json"), base.MaxSignedMetadata)
+	if e != nil {
+		return e
+	}
+	signed, e := base.ParseSigned(raw)
+	if e != nil {
 		return e
 	}
 	b, e := d.Bases.Import(q.Ref, signed, filepath.Join(tmp, "kernel"), filepath.Join(tmp, "rootfs.ext4"))
